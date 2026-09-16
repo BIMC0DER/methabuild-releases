@@ -1,0 +1,102 @@
+name: Publicar Methabuild
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Branch, tag ou commit do repositório privado
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: methabuild-release
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Compilar instalador Windows
+    runs-on: windows-latest
+    steps:
+      - name: Baixar código privado
+        uses: actions/checkout@v4
+        with:
+          repository: Methafora/methaplan
+          ref: ${{ inputs.source_ref }}
+          token: ${{ secrets.METHABUILD_SOURCE_TOKEN }}
+          path: methabuild
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: methabuild/package-lock.json
+
+      - name: Configurar Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Instalar dependências
+        working-directory: methabuild
+        run: npm ci
+
+      - name: Testar
+        working-directory: methabuild
+        run: npm test
+
+      - name: Compilar e assinar aplicativo
+        working-directory: methabuild
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
+        run: npm run desktop:build
+
+      - name: Publicar instalador e manifesto de atualização
+        working-directory: methabuild
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $releaseRepo = '${{ github.repository }}'
+          $version = (node -p "require('./package.json').version").Trim()
+          $configVersion = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $cargoVersion = ([regex]::Match((Get-Content src-tauri/Cargo.toml -Raw), '(?m)^version = "([^"]+)"')).Groups[1].Value
+          if ($version -ne $configVersion -or $version -ne $cargoVersion) {
+            throw "Versões divergentes: package=$version, tauri=$configVersion, cargo=$cargoVersion"
+          }
+
+          $tag = "app-v$version"
+          if (gh release view $tag --repo $releaseRepo 2>$null) {
+            throw "A release $tag já existe. Aumente a versão antes de publicar novamente."
+          }
+
+          $bundleDir = Resolve-Path 'src-tauri/target/release/bundle/nsis'
+          $installer = Get-ChildItem -LiteralPath $bundleDir -Filter '*.exe' | Select-Object -First 1
+          $signature = Get-ChildItem -LiteralPath $bundleDir -Filter '*.sig' | Select-Object -First 1
+          if (-not $installer -or -not $signature) { throw 'Instalador ou assinatura do atualizador não encontrado.' }
+          $updateArtifactPath = $signature.FullName.Substring(0, $signature.FullName.Length - 4)
+          if (-not (Test-Path -LiteralPath $updateArtifactPath)) { throw 'Artefato correspondente à assinatura não encontrado.' }
+          $updateArtifact = Get-Item -LiteralPath $updateArtifactPath
+          $encodedName = [Uri]::EscapeDataString($updateArtifact.Name)
+          $downloadUrl = "https://github.com/$releaseRepo/releases/download/$tag/$encodedName"
+          $latest = @{
+            version = $version
+            notes = "Methabuild $version"
+            pub_date = (Get-Date).ToUniversalTime().ToString('o')
+            platforms = @{
+              'windows-x86_64' = @{
+                signature = (Get-Content -LiteralPath $signature.FullName -Raw).Trim()
+                url = $downloadUrl
+              }
+            }
+          } | ConvertTo-Json -Depth 8
+          $latestPath = Join-Path $bundleDir 'latest.json'
+          [IO.File]::WriteAllText($latestPath, $latest, (New-Object Text.UTF8Encoding($false)))
+
+          gh release create $tag --repo $releaseRepo --title "Methabuild $version" --notes "Instalador oficial do Methabuild $version para Windows." --latest
+          $assets = @($installer.FullName, $updateArtifact.FullName, $signature.FullName, $latestPath) | Select-Object -Unique
+          foreach ($asset in $assets) { gh release upload $tag $asset --repo $releaseRepo }

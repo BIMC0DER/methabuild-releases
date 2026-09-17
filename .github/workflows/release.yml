@@ -54,6 +54,14 @@ jobs:
           VITE_SUPABASE_PUBLISHABLE_KEY: ${{ secrets.VITE_SUPABASE_PUBLISHABLE_KEY }}
         run: npm run desktop:build
 
+      - name: Preservar instalador e assinatura
+        uses: actions/upload-artifact@v4
+        with:
+          name: methabuild-windows
+          path: methabuild/src-tauri/target/release/bundle/nsis/*
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Publicar instalador e manifesto de atualização
         working-directory: methabuild
         shell: pwsh

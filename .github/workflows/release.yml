@@ -38,6 +38,12 @@ jobs:
       - name: Configurar Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Sem cache, cada publicação recompilava todas as crates do Tauri (~7 min).
+      - name: Cache da compilação Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: methabuild/src-tauri -> target
+
       - name: Instalar dependências
         working-directory: methabuild
         run: npm ci
